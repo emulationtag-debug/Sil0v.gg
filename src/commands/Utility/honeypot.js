@@ -1,55 +1,28 @@
-import { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } from 'discord.js';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const dataPath = path.join(__dirname, '../../honeypot-data.json');
-
-let config = {
-    honeypotChannelId: null,
-    logChannelId: null,
-    action: 'kick'
-};
-
-function loadConfig() {
-    if (fs.existsSync(dataPath)) {
-        try {
-            config = { ...config, ...JSON.parse(fs.readFileSync(dataPath, 'utf8')) };
-        } catch (e) {
-            console.error('[Honeypot] Failed to load config', e);
-        }
-    }
-}
-
-function saveConfig() {
-    try {
-        fs.writeFileSync(dataPath, JSON.stringify(config, null, 2));
-    } catch (e) {
-        console.error('[Honeypot] Failed to save config', e);
-    }
-}
-
-loadConfig();
+import { SlashCommandBuilder, EmbedBuilder, PermissionsBitField, ChannelType } from 'discord.js';
+import { getColor } from '../../../config/bot.js';
+import { createEmbed, errorEmbed, successEmbed } from '../../../utils/embeds.js';
+import { getGuildConfig, setGuildConfig } from '../../../services/guildConfig.js';
+import { InteractionHelper } from '../../../utils/interactionHelper.js';
+import { logger } from '../../../utils/logger.js';
 
 export default {
     data: new SlashCommandBuilder()
-        .setName('honeypot-setup')
-        .setDescription('Setup or configure the honeypot trap')
-        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+        .setName('honeypot')
+        .setDescription('Manage the honeypot trap system')
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
         .addSubcommand(sub =>
-            sub.setName('create')
+            sub
+                .setName('setup')
                 .setDescription('Create the hidden honeypot channel')
                 .addRoleOption(opt => opt.setName('admin_role').setDescription('Role that can view the channel').setRequired(false))
         )
         .addSubcommand(sub =>
-            sub.setName('config')
-                .setDescription('Change honeypot settings')
+            sub
+                .setName('config')
+                .setDescription('Configure honeypot settings')
                 .addStringOption(opt =>
                     opt.setName('action')
-                        .setDescription('Default action')
+                        .setDescription('Action when triggered')
                         .setChoices(
                             { name: 'Kick', value: 'kick' },
                             { name: 'Ban', value: 'ban' }
@@ -57,115 +30,104 @@ export default {
                 )
                 .addChannelOption(opt =>
                     opt.setName('log_channel')
-                        .setDescription('Mod log channel')
-                        .addChannelTypes(0)
+                        .setDescription('Log channel for honeypot triggers')
+                        .addChannelTypes(ChannelType.GuildText)
                 )
         ),
 
-    async execute(interaction) {
-        if (interaction.options.getSubcommand() === 'create') {
-            await handleCreate(interaction);
-        } else {
-            await handleConfig(interaction);
+    async execute(interaction, config, client) {
+        const subcommand = interaction.options.getSubcommand();
+
+        if (subcommand === 'setup') {
+            await handleSetup(interaction, client);
+        } else if (subcommand === 'config') {
+            await handleConfig(interaction, client);
         }
     }
 };
 
-async function handleCreate(interaction) {
-    await interaction.deferReply();
+async function handleSetup(interaction, client) {
+    await InteractionHelper.safeDefer(interaction);
+
     const guild = interaction.guild;
     const adminRole = interaction.options.getRole('admin_role');
+    const guildConfig = await getGuildConfig(client, guild.id);
 
-    let channel = config.honeypotChannelId ? guild.channels.cache.get(config.honeypotChannelId) : null;
+    if (guildConfig.honeypotChannelId) {
+        const existing = guild.channels.cache.get(guildConfig.honeypotChannelId);
+        if (existing) {
+            return InteractionHelper.safeEditReply(interaction, {
+                embeds: [successEmbed('Honeypot Exists', `Honeypot is already set up: ${existing}`)]
+            });
+        }
+    }
 
-    if (!channel) {
+    try {
         const overwrites = [
-            { id: guild.id, deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
-            { id: interaction.client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageMessages] }
+            {
+                id: guild.id,
+                deny: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages]
+            },
+            {
+                id: client.user.id,
+                allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageMessages]
+            }
         ];
 
         if (adminRole) {
             overwrites.push({
                 id: adminRole.id,
-                allow: [PermissionFlagsBits.ViewChannel],
-                deny: [PermissionFlagsBits.SendMessages]
+                allow: [PermissionsBitField.Flags.ViewChannel],
+                deny: [PermissionsBitField.Flags.SendMessages]
             });
         }
 
-        channel = await guild.channels.create({
+        const honeypotChannel = await guild.channels.create({
             name: 'honeypot',
-            type: 0,
-            topic: 'Honeypot • DO NOT POST - Instant kick',
+            type: ChannelType.GuildText,
+            topic: 'Honeypot Trap • DO NOT POST HERE - Instant Action',
             permissionOverwrites: overwrites,
-            reason: 'Anti-raid honeypot'
+            reason: 'Anti-raid honeypot system'
         });
 
-        config.honeypotChannelId = channel.id;
-        saveConfig();
+        guildConfig.honeypotChannelId = honeypotChannel.id;
+        await setGuildConfig(client, guild.id, guildConfig);
 
-        await interaction.editReply(`✅ **Honeypot created:** ${channel}\n\nDefault action: **KICK**`);
-    } else {
-        await interaction.editReply(`✅ Honeypot already exists: <#${config.honeypotChannelId}>`);
+        await InteractionHelper.safeEditReply(interaction, {
+            embeds: [successEmbed('✅ Honeypot Created', `${honeypotChannel}\n\nDefault action: **KICK**`)]
+        });
+
+        logger.info('Honeypot channel created', { guildId: guild.id, channelId: honeypotChannel.id });
+
+    } catch (error) {
+        logger.error('Honeypot setup error:', error);
+        await handleInteractionError(interaction, error, { commandName: 'honeypot setup' });
     }
 }
 
-async function handleConfig(interaction) {
-    await interaction.deferReply({ ephemeral: true });
+async function handleConfig(interaction, client) {
+    await InteractionHelper.safeDefer(interaction, { ephemeral: true });
 
     const action = interaction.options.getString('action');
     const logChannel = interaction.options.getChannel('log_channel');
+    const guildConfig = await getGuildConfig(client, interaction.guildId);
 
     if (action) {
-        config.action = action;
-        saveConfig();
+        guildConfig.honeypotAction = action;
+        await setGuildConfig(client, interaction.guildId, guildConfig);
     }
+
     if (logChannel) {
-        config.logChannelId = logChannel.id;
-        saveConfig();
+        guildConfig.honeypotLogChannelId = logChannel.id;
+        await setGuildConfig(client, interaction.guildId, guildConfig);
     }
 
-    const embed = new EmbedBuilder()
-        .setTitle('🪤 Honeypot Config')
-        .setColor(0x00ff00)
-        .addFields(
-            { name: 'Action', value: config.action.toUpperCase(), inline: true },
-            { name: 'Honeypot Channel', value: config.honeypotChannelId ? `<#${config.honeypotChannelId}>` : 'Not set', inline: true },
-            { name: 'Log Channel', value: config.logChannelId ? `<#${config.logChannelId}>` : 'Not set', inline: true }
-        );
+    const embed = createEmbed({
+        title: '🪤 Honeypot Configuration',
+        description: `**Action:** ${guildConfig.honeypotAction?.toUpperCase() || 'KICK'}\n` +
+                     `**Honeypot Channel:** ${guildConfig.honeypotChannelId ? `<#${guildConfig.honeypotChannelId}>` : 'Not set'}\n` +
+                     `**Log Channel:** ${guildConfig.honeypotLogChannelId ? `<#${guildConfig.honeypotLogChannelId}>` : 'Not set'}`
+    }).setColor(getColor('success'));
 
-    await interaction.editReply({ embeds: [embed] });
+    await InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
 }
-
-// Export listener for messageCreate
-export const messageListener = async (message) => {
-    if (message.author.bot || !message.guild || !config.honeypotChannelId) return;
-    if (message.channel.id !== config.honeypotChannelId) return;
-
-    const guild = message.guild;
-    const action = config.action || 'kick';
-    let logChannel = config.logChannelId ? guild.channels.cache.get(config.logChannelId) : null;
-
-    try {
-        const reason = 'Honeypot trigger: Posted in restricted trap channel';
-
-        if (action === 'ban') {
-            await guild.bans.create(message.author, { deleteMessageSeconds: 86400, reason });
-        } else {
-            await guild.members.kick(message.author, reason);
-        }
-
-        const embed = new EmbedBuilder()
-            .setTitle('🪤 Honeypot Triggered')
-            .setColor(0xff0000)
-            .setDescription(`**User:** ${message.author.tag} (${message.author.id})\n**Action:** ${action.toUpperCase()}`)
-            .addFields({ name: 'Content', value: message.content?.slice(0, 1024) || '*None*' })
-            .setTimestamp();
-
-        if (logChannel) await logChannel.send({ embeds: [embed] });
-        await message.delete().catch(() => {});
-
-    } catch (err) {
-        console.error('[Honeypot] Error:', err);
-        if (logChannel) logChannel.send(`⚠️ Honeypot failed for ${message.author}`).catch(() => {});
-    }
-};
